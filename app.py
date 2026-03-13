@@ -1,49 +1,17 @@
+import glob
+import html
 import os
 import re
-import sys
+import tempfile
 import threading
 import time
 import webbrowser
-import urllib.request
-import html
-import ssl
-import certifi
 from typing import Optional
 
 from flask import Flask, request, jsonify, render_template_string
 import yt_dlp
 
 app = Flask(__name__)
-
-
-def resource_path(relative_path: str) -> str:
-    """
-    Return absolute path to resource, works for dev and PyInstaller.
-    """
-    base_path = getattr(sys, "_MEIPASS", os.path.abspath("."))
-    return os.path.join(base_path, relative_path)
-
-
-def configure_ssl() -> str:
-    """
-    Ensure Python/OpenSSL can find the CA bundle both in normal execution
-    and inside a PyInstaller bundle.
-    """
-    cert_path = certifi.where()
-
-    # In some PyInstaller builds, certifi is collected into the bundle.
-    bundled_cert = resource_path("certifi/cacert.pem")
-    if os.path.exists(bundled_cert):
-        cert_path = bundled_cert
-
-    os.environ["SSL_CERT_FILE"] = cert_path
-    os.environ["REQUESTS_CA_BUNDLE"] = cert_path
-    os.environ["CURL_CA_BUNDLE"] = cert_path
-
-    return cert_path
-
-
-CA_CERT_PATH = configure_ssl()
 
 
 HTML_PAGE = """
@@ -365,66 +333,57 @@ def parse_vtt(vtt_content: str) -> str:
     return "\n".join(result)
 
 
-def choose_best_format(formats: list[dict]) -> dict:
-    preferred_exts = ["vtt", "ttml", "srv3", "srv2", "srv1", "json3"]
-
-    for ext in preferred_exts:
-        for fmt in formats:
-            if fmt.get("ext") == ext and fmt.get("url"):
-                return fmt
-
-    for fmt in formats:
-        if fmt.get("url"):
-            return fmt
-
-    raise RuntimeError("No usable subtitle format with URL found.")
-
-
-def pick_subtitle_track(tracks: dict, preferred_langs: list[str]) -> Optional[tuple[str, dict]]:
-    if not tracks:
+def choose_best_lang(available_langs: list[str], preferred_langs: list[str]) -> Optional[str]:
+    if not available_langs:
         return None
 
     for lang in preferred_langs:
-        if lang in tracks and tracks[lang]:
-            return lang, choose_best_format(tracks[lang])
+        if lang in available_langs:
+            return lang
 
     for lang in preferred_langs:
         prefix = lang.split("-")[0]
-        for available_lang, formats in tracks.items():
-            if available_lang == prefix or available_lang.startswith(prefix + "-"):
-                if formats:
-                    return available_lang, choose_best_format(formats)
+        for available in available_langs:
+            if available == prefix or available.startswith(prefix + "-"):
+                return available
 
-    for available_lang, formats in tracks.items():
-        if formats:
-            return available_lang, choose_best_format(formats)
-
-    return None
+    return available_langs[0]
 
 
-def download_text(url: str) -> str:
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/122.0.0.0 Safari/537.36"
-            )
-        },
-    )
+def list_downloaded_subtitle_files(tmpdir: str) -> list[str]:
+    patterns = [
+        os.path.join(tmpdir, "*.vtt"),
+        os.path.join(tmpdir, "*.ttml"),
+        os.path.join(tmpdir, "*.srv3"),
+        os.path.join(tmpdir, "*.srv2"),
+        os.path.join(tmpdir, "*.srv1"),
+        os.path.join(tmpdir, "*.json3"),
+    ]
 
-    ssl_context = ssl.create_default_context(cafile=CA_CERT_PATH)
-
-    with urllib.request.urlopen(req, timeout=30, context=ssl_context) as resp:
-        charset = resp.headers.get_content_charset() or "utf-8"
-        return resp.read().decode(charset, errors="replace")
+    files = []
+    for pattern in patterns:
+        files.extend(glob.glob(pattern))
+    return files
 
 
-def fetch_transcript(url: str, video_id: str):
-    preferred_langs = ["en", "en-US", "en-GB"]
+def read_subtitle_file(path: str) -> str:
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        raw = f.read()
 
-    base_opts = {
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".vtt":
+        return parse_vtt(raw)
+
+    return html.unescape(raw).strip()
+
+
+def download_subtitles_with_ytdlp(
+    url: str,
+    tmpdir: str,
+    preferred_langs: list[str],
+    use_cookies: bool,
+) -> tuple[dict, str, str]:
+    info_opts = {
         "skip_download": True,
         "quiet": True,
         "no_warnings": True,
@@ -433,57 +392,88 @@ def fetch_transcript(url: str, video_id: str):
         "extract_flat": False,
     }
 
-    attempts = [
-        {**base_opts, "cookiesfrombrowser": ("chrome",)},
-        base_opts,
-    ]
+    if use_cookies:
+        info_opts["cookiesfrombrowser"] = ("chrome",)
 
-    last_error = None
-    info = None
+    with yt_dlp.YoutubeDL(info_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
 
-    for opts in attempts:
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-            if info:
-                break
-        except Exception as e:
-            last_error = e
-
-    if info is None:
-        raise RuntimeError(f"Could not extract video info. Last error: {last_error}")
-
-    title = info.get("title", video_id)
     subtitles = info.get("subtitles") or {}
     automatic_captions = info.get("automatic_captions") or {}
 
-    selected = pick_subtitle_track(subtitles, preferred_langs)
+    selected_lang = choose_best_lang(list(subtitles.keys()), preferred_langs)
     source_type = "manual subtitles"
 
-    if selected is None:
-        selected = pick_subtitle_track(automatic_captions, preferred_langs)
+    if selected_lang is None:
+        selected_lang = choose_best_lang(list(automatic_captions.keys()), preferred_langs)
         source_type = "automatic captions"
 
-    if selected is None:
+    if selected_lang is None:
         raise RuntimeError("No subtitles or automatic captions available for this video.")
 
-    lang_used, fmt = selected
-    subtitle_url = fmt.get("url")
+    download_opts = {
+        "skip_download": True,
+        "quiet": True,
+        "no_warnings": True,
+        "ignoreconfig": True,
+        "noplaylist": True,
+        "writesubtitles": source_type == "manual subtitles",
+        "writeautomaticsub": source_type == "automatic captions",
+        "subtitleslangs": [selected_lang],
+        "subtitlesformat": "vtt/best",
+        "outtmpl": os.path.join(tmpdir, "transcript.%(ext)s"),
+    }
 
-    if not subtitle_url:
-        raise RuntimeError("Subtitle track found, but it has no downloadable URL.")
+    if use_cookies:
+        download_opts["cookiesfrombrowser"] = ("chrome",)
 
-    raw = download_text(subtitle_url)
+    with yt_dlp.YoutubeDL(download_opts) as ydl:
+        ydl.extract_info(url, download=True)
 
-    if fmt.get("ext") == "vtt":
-        text = parse_vtt(raw)
-    else:
-        text = html.unescape(raw).strip()
+    files = list_downloaded_subtitle_files(tmpdir)
+    if not files:
+        raise RuntimeError("Subtitle download completed, but no subtitle file was found.")
 
-    if not text.strip():
-        raise RuntimeError("Subtitle file was downloaded but parsed as empty.")
+    return info, selected_lang, source_type
 
-    return text, lang_used, title, source_type
+
+def fetch_transcript(url: str, video_id: str):
+    preferred_langs = ["en", "en-US", "en-GB"]
+    last_error = None
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        info = None
+        lang_used = None
+        source_type = None
+
+        for use_cookies in [True, False]:
+            try:
+                info, lang_used, source_type = download_subtitles_with_ytdlp(
+                    url=url,
+                    tmpdir=tmpdir,
+                    preferred_langs=preferred_langs,
+                    use_cookies=use_cookies,
+                )
+                break
+            except Exception as e:
+                last_error = e
+
+        if info is None or lang_used is None or source_type is None:
+            raise RuntimeError(f"Could not download subtitles. Last error: {last_error}")
+
+        title = info.get("title", video_id)
+
+        files = list_downloaded_subtitle_files(tmpdir)
+        if not files:
+            raise RuntimeError("No downloaded subtitle file found after yt-dlp finished.")
+
+        subtitle_path = files[0]
+        text = read_subtitle_file(subtitle_path)
+
+        if not text.strip():
+            raise RuntimeError("Subtitle file was downloaded but parsed as empty.")
+
+        return text, lang_used, title, source_type
 
 
 @app.route("/", methods=["GET"])

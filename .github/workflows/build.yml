@@ -33,7 +33,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Build with PyInstaller
-        run: pyinstaller --onefile --collect-data certifi app.py
+        run: pyinstaller --onefile app.py
         shell: bash
 
       - name: Upload artifact
