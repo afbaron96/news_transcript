@@ -43,3 +43,5 @@ Then download the artifacts from the workflow run.
 - The Windows `.exe` is built on GitHub's Windows runner, not on macOS locally.
 - The app opens your default browser at `http://127.0.0.1:5000`.
 - Closing the browser tab does not always stop the process; stop the app in the terminal if needed.
+
+Windows: winget install ffmpeg
